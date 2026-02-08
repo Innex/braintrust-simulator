@@ -12,46 +12,108 @@ interface DatasetRow {
   id: string;
   input: unknown;
   output?: unknown;
+  expected?: unknown;
   metadata?: unknown;
+}
+
+/** Try to coerce a single item into a ChatMessage. Handles {role,content}, {role,text}, plain strings. */
+function toMessage(item: unknown, fallbackRole?: string): ChatMessage | null {
+  if (typeof item === "object" && item !== null) {
+    const obj = item as Record<string, unknown>;
+    const role = typeof obj.role === "string" ? obj.role : fallbackRole;
+    const content =
+      typeof obj.content === "string"
+        ? obj.content
+        : typeof obj.text === "string"
+          ? obj.text
+          : typeof obj.message === "string"
+            ? obj.message
+            : null;
+    if (role && content) {
+      return { role, content };
+    }
+  }
+  if (typeof item === "string" && fallbackRole) {
+    return { role: fallbackRole, content: item };
+  }
+  return null;
+}
+
+/** Extract an array of ChatMessages from an unknown value (could be array, object with messages/conversation/chat key, etc.) */
+function extractMessages(value: unknown): ChatMessage[] {
+  if (!value) return [];
+
+  // Direct array of messages
+  if (Array.isArray(value)) {
+    const msgs = value.map((m) => toMessage(m)).filter((m): m is ChatMessage => m !== null);
+    if (msgs.length > 0) return msgs;
+  }
+
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+    // Nested under common keys: messages, conversation, chat, turns, history, thread
+    for (const key of ["messages", "conversation", "chat", "turns", "history", "thread"]) {
+      if (Array.isArray(obj[key])) {
+        const msgs = (obj[key] as unknown[])
+          .map((m) => toMessage(m))
+          .filter((m): m is ChatMessage => m !== null);
+        if (msgs.length > 0) return msgs;
+      }
+    }
+  }
+
+  return [];
 }
 
 function normalizeDatasetRows(
   rows: DatasetRow[]
-): Array<{ id: string; messages: ChatMessage[] }> {
+): { normalized: Array<{ id: string; messages: ChatMessage[] }>; sampleKeys: string[] } {
   const normalized: Array<{ id: string; messages: ChatMessage[] }> = [];
+  let sampleKeys: string[] = [];
 
   for (const row of rows) {
     const id = row.id ?? `row-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+    // Capture sample keys from first row for error reporting
+    if (sampleKeys.length === 0) {
+      sampleKeys = Object.keys(row);
+      if (typeof row.input === "object" && row.input !== null && !Array.isArray(row.input)) {
+        sampleKeys = sampleKeys.concat(
+          Object.keys(row.input as Record<string, unknown>).map((k) => `input.${k}`)
+        );
+      }
+    }
+
     let messages: ChatMessage[] = [];
 
-    if (Array.isArray(row.input)) {
-      const validMessages = row.input.filter(
-        (m): m is ChatMessage =>
-          typeof m === "object" &&
-          m !== null &&
-          typeof (m as Record<string, unknown>).role === "string" &&
-          typeof (m as Record<string, unknown>).content === "string"
-      );
-      if (validMessages.length > 0) {
-        messages = validMessages;
+    // 1. Try extracting from input (most common)
+    messages = extractMessages(row.input);
+
+    // 2. Try extracting from output if input had nothing
+    if (messages.length === 0) {
+      messages = extractMessages(row.output);
+    }
+
+    // 3. Try extracting from expected
+    if (messages.length === 0) {
+      messages = extractMessages(row.expected);
+    }
+
+    // 4. Try input as string + output as string → synthetic 2-turn conversation
+    if (messages.length === 0) {
+      const inputMsg = toMessage(row.input, "user");
+      const outputMsg = toMessage(row.output, "assistant");
+      if (inputMsg && outputMsg) {
+        messages = [inputMsg, outputMsg];
+      } else if (inputMsg) {
+        // Single-turn: just the user message (useful if output is structured/non-string)
+        messages = [inputMsg];
       }
-    } else if (
-      typeof row.input === "object" &&
-      row.input !== null &&
-      "messages" in row.input &&
-      Array.isArray((row.input as Record<string, unknown>).messages)
-    ) {
-      const nested = (row.input as Record<string, unknown>).messages as unknown[];
-      const validMessages = nested.filter(
-        (m): m is ChatMessage =>
-          typeof m === "object" &&
-          m !== null &&
-          typeof (m as Record<string, unknown>).role === "string" &&
-          typeof (m as Record<string, unknown>).content === "string"
-      );
-      if (validMessages.length > 0) {
-        messages = validMessages;
-      }
+    }
+
+    // 5. Try top-level row keys (some datasets put messages at root level)
+    if (messages.length === 0) {
+      messages = extractMessages(row);
     }
 
     if (messages.length > 0) {
@@ -59,7 +121,7 @@ function normalizeDatasetRows(
     }
   }
 
-  return normalized;
+  return { normalized, sampleKeys };
 }
 
 export function useDatasetProfiles(apiKey: string | null) {
@@ -97,11 +159,14 @@ export function useDatasetProfiles(apiKey: string | null) {
           throw new Error("Dataset has no rows");
         }
 
-        const normalized = normalizeDatasetRows(rawRows);
+        const { normalized, sampleKeys } = normalizeDatasetRows(rawRows);
 
         if (normalized.length === 0) {
+          const keysHint = sampleKeys.length > 0
+            ? ` Found keys: [${sampleKeys.join(", ")}].`
+            : "";
           throw new Error(
-            "No conversation rows found in dataset. Rows must contain messages with role and content fields."
+            `No conversation rows found in dataset.${keysHint} Expected messages with role and content fields in input (as array, or under input.messages/input.conversation), or input/output string pairs.`
           );
         }
 
